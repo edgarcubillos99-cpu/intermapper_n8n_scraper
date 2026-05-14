@@ -42,34 +42,32 @@ async def run_scraper_phase():
     return sites_to_process
 
 async def run_n8n_phase(sites_to_process: list):
-    """Fase 2: Envío de capturas a n8n concurrentemente y limpieza local"""
-    logger.info("--- INICIANDO FASE 2: ENVÍO A N8N Y LIMPIEZA ---")
-    
-    # Creamos un semáforo para no saturar n8n con 50 requests simultáneos.
-    n8n_semaphore = asyncio.Semaphore(5)
+    """Fase 2: Envío de capturas a n8n de forma secuencial (1 imagen por minuto)."""
+    interval = Config.N8N_SEND_INTERVAL_SECONDS
+    total = len(sites_to_process)
+    logger.info(
+        f"--- INICIANDO FASE 2: ENVÍO A N8N (throttle {interval}s entre envíos, {total} pendientes) ---"
+    )
 
-    async def _bounded_send(tower, path: Path):
-        async with n8n_semaphore:
-            # Enviamos a n8n y guardamos el resultado (True si fue exitoso)
-            success = await send_image_to_n8n(tower, path)
-            
-            # Si n8n respondió 200 OK, procedemos a borrar el archivo físico
-            if success:
-                try:
-                    # unlink() elimina el archivo de forma nativa en Python
-                    path.unlink(missing_ok=True) 
-                    logger.info(f"[{tower}] 🗑️ Imagen local eliminada para liberar espacio.")
-                except Exception as e:
-                    logger.error(f"[{tower}] ⚠️ No se pudo borrar la imagen local {path.name}: {e}")
-            else:
-                logger.warning(f"[{tower}] 💾 La imagen se conservó localmente porque falló el envío a n8n.")
+    async def _send_one(tower: str, path: Path):
+        success = await send_image_to_n8n(tower, path)
+        if success:
+            try:
+                path.unlink(missing_ok=True)
+                logger.info(f"[{tower}] 🗑️ Imagen local eliminada para liberar espacio.")
+            except Exception as e:
+                logger.error(f"[{tower}] ⚠️ No se pudo borrar la imagen local {path.name}: {e}")
+        else:
+            logger.warning(f"[{tower}] 💾 La imagen se conservó localmente porque falló el envío a n8n.")
 
-    tasks = [
-        _bounded_send(tower_name, screenshot_path) 
-        for tower_name, screenshot_path, _url in sites_to_process
-    ]
-    
-    await asyncio.gather(*tasks)
+    for idx, (tower_name, screenshot_path, _url) in enumerate(sites_to_process, start=1):
+        logger.info(f"📦 Envío {idx}/{total} — torre: {tower_name}")
+        await _send_one(tower_name, screenshot_path)
+
+        # Esperamos solo si quedan más envíos pendientes.
+        if idx < total:
+            logger.info(f"⏳ Esperando {interval}s antes del siguiente envío...")
+            await asyncio.sleep(interval)
 
 async def main_async():
     logger.info("Iniciando Pipeline de Scraping hacia n8n...")

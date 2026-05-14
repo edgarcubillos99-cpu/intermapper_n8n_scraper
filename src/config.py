@@ -17,6 +17,17 @@ class Config:
     
     WORKERS = int(os.getenv("CONCURRENT_WORKERS", 3))
 
+    # Intervalo en segundos entre cada envío de imagen a n8n (throttling).
+    # Por defecto: 60s => 1 imagen por minuto.
+    N8N_SEND_INTERVAL_SECONDS = int(os.getenv("N8N_SEND_INTERVAL_SECONDS", 60))
+
+    DB_HOST = os.getenv("DB_HOST")
+    DB_USER = os.getenv("DB_USER")
+    DB_PASS = os.getenv("DB_PASS")
+    DB_NAME = os.getenv("DB_NAME")
+
+    MCP_BEARER_TOKEN = os.getenv("MCP_BEARER_TOKEN")
+    
     @classmethod
     def setup_directories(cls):
         cls.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
