@@ -30,6 +30,23 @@ def fallback_map_slug_from_url(url: str) -> str:
     return f"x{h[:12]}"
 
 
+def normalize_ap_name(name: str) -> str:
+    """Toma el primer 'token' del nombre del AP para hacer match entre n8n
+    e Intermapper.
+
+    Ejemplos:
+        'OSNAP22-A (Lite AC)' -> 'OSNAP22-A'
+        'OSNAP22-C ePMP3000L' -> 'OSNAP22-C'
+        'osnap22-a' -> 'OSNAP22-A'
+    """
+    if not name:
+        return ""
+    cleaned = name.strip().split("(")[0].strip()
+    if " " in cleaned:
+        cleaned = cleaned.split(" ", 1)[0]
+    return cleaned.upper()
+
+
 def tower_name_from_screenshot_stem(stem: str) -> str:
     """Nombre lógico de torre para BD/OCR (sin id de Intermapper).
 

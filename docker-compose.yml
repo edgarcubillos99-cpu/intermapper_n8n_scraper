@@ -1,0 +1,34 @@
+services:
+  intermapper-app:
+    build: .
+    image: intermapper-app:latest
+    container_name: intermapper-app
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Si tu MySQL corre en el host (fuera de Docker), descomenta la línea
+      # siguiente y deja DB_HOST con este valor en .env, o sobrescribe aquí:
+      # DB_HOST: host.docker.internal
+      DATA_DIR: /app/data
+      SCREENSHOT_DIR: /app/screenshots
+    volumes:
+      # Persistir el ip_map.json y otros datos generados entre reinicios.
+      - ./data:/app/data
+      # Persistir capturas pendientes de enviar (sobreviven a reinicios).
+      - ./screenshots:/app/screenshots
+    # Permite que el contenedor alcance servicios del host (MySQL local, n8n local, etc.)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3); sys.exit(0 if r.status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

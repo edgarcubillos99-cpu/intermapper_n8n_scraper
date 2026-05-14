@@ -1,4 +1,6 @@
 import asyncio
+import re
+from urllib.parse import urljoin
 
 from src.config import Config
 from src.logger import get_logger
@@ -10,6 +12,14 @@ from src.scraper.tower_naming import (
 )
 
 logger = get_logger(__name__)
+
+# Regex para extraer la IPv4 que aparece tras el label "Address:" en !device.html
+_ADDRESS_RE = re.compile(
+    r"Address:\s*</font>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
+    re.IGNORECASE,
+)
+# Filtro: solo procesar dispositivos cuyo nombre visible NO sea solo una IP
+_LOOKS_LIKE_IP = re.compile(r"^\s*[0-9]{1,3}(?:\.[0-9]{1,3}){3}\s*$")
 
 class IntermapperScraper:
     def __init__(self, context):
@@ -47,7 +57,11 @@ class IntermapperScraper:
         return unique_links
 
     async def process_site(self, url, semaphore):
-        """Navega a un site específico y toma la captura. Devuelve (torre, ruta_png, url) o None."""
+        """Navega a un site específico, toma la captura y recolecta IPs de sus
+        dispositivos. Devuelve (torre, ruta_png, url, devices_ip_dict) o None.
+
+        devices_ip_dict tiene la forma {ap_name_completo: ip_address}.
+        """
         async with semaphore:
             page = await self.context.new_page()
             try:
@@ -84,10 +98,74 @@ class IntermapperScraper:
                 logger.info(f"📸 Captura guardada: {screenshot_path}")
 
                 tower_name = tower_name_from_screenshot_stem(screenshot_path.stem)
-                return (tower_name, screenshot_path, final_url)
+
+                # Reutilizamos la misma página para entrar al Device List y a
+                # cada dispositivo. Es secuencial dentro del site para no abrir
+                # docenas de pestañas en paralelo.
+                devices_ips = await self._collect_device_ips(page, final_url, tower_name)
+
+                return (tower_name, screenshot_path, final_url, devices_ips)
 
             except Exception as e:
                 logger.error(f"Error procesando {url}: {e}")
                 return None
             finally:
                 await page.close()
+
+    async def _collect_device_ips(self, page, submap_url: str, tower_name: str) -> dict:
+        """Navega al device_list.html del submapa, entra a cada dispositivo con
+        enlace a !device.html y devuelve {ap_name_completo: ip}.
+
+        No falla el proceso si algún dispositivo no se puede leer; loggea y sigue.
+        """
+        ip_map: dict[str, str] = {}
+        try:
+            # Construimos la URL absoluta del Device List desde la URL del submapa.
+            device_list_url = urljoin(submap_url, "device_list.html?REFRESH=30+Seconds")
+            logger.info(f"[{tower_name}] 🔎 Abriendo Device List: {device_list_url}")
+            await page.goto(device_list_url, wait_until="domcontentloaded")
+
+            # Extraemos (nombre_visible, href_absoluto) de cada enlace de dispositivo.
+            # Los enlaces de dispositivo tienen path .../device/.../!device.html
+            devices = await page.locator("a[href*='/device/'][href*='!device.html']").evaluate_all(
+                "els => els.map(a => ({ name: (a.textContent || '').trim(), href: a.href }))"
+            )
+            # Quitamos duplicados conservando el orden
+            seen = set()
+            unique_devices = []
+            for d in devices:
+                key = (d["name"], d["href"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_devices.append(d)
+
+            logger.info(f"[{tower_name}] {len(unique_devices)} dispositivos detectados en Device List.")
+        except Exception as e:
+            logger.warning(f"[{tower_name}] ⚠️ No se pudo abrir Device List ({e}); sin IPs para esta torre.")
+            return ip_map
+
+        for dev in unique_devices:
+            ap_name = dev["name"]
+            href = dev["href"]
+
+            if not ap_name:
+                continue
+            # Saltamos filas cuyo "nombre" es ya una IP (no son APs nombrados)
+            if _LOOKS_LIKE_IP.match(ap_name):
+                continue
+
+            try:
+                await page.goto(href, wait_until="domcontentloaded")
+                html = await page.content()
+                m = _ADDRESS_RE.search(html)
+                if m:
+                    ip = m.group(1)
+                    ip_map[ap_name] = ip
+                    logger.info(f"[{tower_name}]    └─ {ap_name} → {ip}")
+                else:
+                    logger.warning(f"[{tower_name}]    └─ {ap_name} sin Address visible en !device.html")
+            except Exception as e:
+                logger.warning(f"[{tower_name}]    └─ Error leyendo {ap_name}: {e}")
+
+        return ip_map
