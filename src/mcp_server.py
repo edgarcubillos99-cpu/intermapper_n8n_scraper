@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List
+from typing import Annotated, List
 
 # Permite ejecutar este archivo directamente (`python src/mcp_server.py`)
 # añadiendo la raíz del proyecto al sys.path para resolver `from src...`.
@@ -16,10 +18,11 @@ import uvicorn  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
-from pydantic import BaseModel, Field  # noqa: E402
+from pydantic import BaseModel, Field, WithJsonSchema  # noqa: E402
 from starlette.types import ASGIApp, Receive, Scope, Send  # noqa: E402
 
 from src.config import Config  # noqa: E402
+from src.db_schema import ensure_intermapper_tables  # noqa: E402
 from src.scraper.tower_naming import normalize_ap_name  # noqa: E402
 
 load_dotenv()
@@ -34,6 +37,29 @@ class APDeviceInfo(BaseModel):
     azimut: str = Field(description="Dirección en grados")
     tilt: str = Field(description="Inclinación del equipo")
     altura: str = Field(description="Altura en pies (Ft)")
+
+
+# Esquema inline (sin $ref/$defs): Google Gemini exige `type: array` + `items`
+# y rechaza o pierde `items` si solo queda una referencia que el cliente no resuelve.
+_APS_DATA_JSON_SCHEMA = {
+    "type": "array",
+    "description": "Lista de APs detectados en el mapa Intermapper para sincronizar.",
+    "items": {
+        "type": "object",
+        "properties": {
+            "torre": {"type": "string", "description": "Nombre de la torre"},
+            "ap_name": {"type": "string", "description": "Nombre del Access Point"},
+            "tipo": {
+                "type": "string",
+                "description": "Tipo de tecnología (ePMP, Rocket AC, etc)",
+            },
+            "azimut": {"type": "string", "description": "Dirección en grados"},
+            "tilt": {"type": "string", "description": "Inclinación del equipo"},
+            "altura": {"type": "string", "description": "Altura en pies (Ft)"},
+        },
+        "required": ["torre", "ap_name", "tipo", "azimut", "tilt", "altura"],
+    },
+}
 
 
 # --- CONFIG / SEGURIDAD ---
@@ -66,6 +92,39 @@ def get_db_connection():
         database=os.getenv("DB_NAME"),
         cursorclass=pymysql.cursors.DictCursor,
     )
+
+
+def _bootstrap_mysql_schema_once() -> None:
+    connection = get_db_connection()
+    try:
+        ensure_intermapper_tables(connection)
+    finally:
+        connection.close()
+
+
+async def _bootstrap_mysql_schema_with_retries(
+    max_attempts: int = 15,
+    delay_s: float = 2.0,
+) -> None:
+    """Espera a que MySQL acepte conexión (p. ej. contenedor recién levantado)."""
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await asyncio.to_thread(_bootstrap_mysql_schema_once)
+            return
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "Esquema MySQL no listo (intento %s/%s): %s",
+                attempt,
+                max_attempts,
+                e,
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(delay_s)
+    assert last_err is not None
+    logger.error("No se pudo crear/verificar tablas en MySQL tras varios reintentos.")
+    raise last_err
 
 
 # --- HELPERS PARA IP_ADDRESS ---
@@ -128,7 +187,9 @@ def _ensure_ip_address_column(connection) -> None:
 
 
 @mcp.tool()
-def sync_intermapper_data(aps_data: List[APDeviceInfo]) -> str:
+def sync_intermapper_data(
+    aps_data: Annotated[List[APDeviceInfo], WithJsonSchema(_APS_DATA_JSON_SCHEMA)],
+) -> str:
     """
     Sincroniza los datos extraídos de Intermapper en las tablas 'torres' y 'dispositivos_ap'.
 
@@ -264,7 +325,13 @@ async def _send_json(send: Send, status: int, body: dict) -> None:
 
 
 # --- EXPOSICIÓN FASTAPI ---
-app = FastAPI(title="Intermapper MCP Server")
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    await _bootstrap_mysql_schema_with_retries()
+    yield
+
+
+app = FastAPI(title="Intermapper MCP Server", lifespan=_app_lifespan)
 app.add_middleware(BearerAuthMiddleware)
 
 
