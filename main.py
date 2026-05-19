@@ -62,9 +62,8 @@ async def run_scraper_phase():
     return sites_to_process
 
 
-def persist_ip_map(sites_to_process: list) -> None:
-    """Escribe {torre: {ap_name: ip}} a Config.IP_MAP_PATH para que el MCP
-    server lo consuma al recibir datos de n8n."""
+def persist_ip_map(sites_to_process: list) -> dict:
+    """Escribe {torre: {ap_name: ip}} a Config.IP_MAP_PATH y devuelve el diccionario."""
     ip_map: dict[str, dict[str, str]] = {}
     for tower_name, _path, _url, devices in sites_to_process:
         if not devices:
@@ -81,6 +80,7 @@ def persist_ip_map(sites_to_process: list) -> None:
         f"💾 ip_map.json escrito en {Config.IP_MAP_PATH} "
         f"({len(ip_map)} torres, {total_ips} IPs)."
     )
+    return ip_map
 
 
 async def run_n8n_phase(sites_to_process: list):
@@ -112,14 +112,35 @@ async def run_n8n_phase(sites_to_process: list):
 
 
 async def run_pipeline_once():
-    """Una corrida completa del pipeline (Fase 1 + Fase 2)."""
+    """Una corrida completa del pipeline (Fase 1 + Fase Intermedia + Fase 2)."""
     start_time = time.time()
     Config.setup_directories()
 
     sites_to_process = await run_scraper_phase()
     logger.info(f"Fase 1 completada. {len(sites_to_process)} capturas listas.")
 
-    persist_ip_map(sites_to_process)
+    # Almacenamos el JSON y mantenemos el mapa en memoria
+    ip_map = persist_ip_map(sites_to_process)
+
+    # --- NUEVA FASE INTERMEDIA: Sincronización en BD en Background ---
+    def _sync_db_phase():
+        from src.mcp_server import get_db_connection
+        from src.db_schema import ensure_intermapper_tables, sync_all_devices
+        conn = get_db_connection()
+        try:
+            ensure_intermapper_tables(conn)
+            if ip_map:
+                sync_all_devices(conn, ip_map)
+        finally:
+            conn.close()
+
+    logger.info("--- INICIANDO FASE INTERMEDIA: SINCRONIZACIÓN DE DISPOSITIVOS EN BD ---")
+    try:
+        # Se ejecuta en un Threadpool para evitar bloquear el ciclo de eventos asíncrono del MCP
+        await asyncio.to_thread(_sync_db_phase)
+    except Exception as e:
+        logger.error(f"⚠️ Error en la sincronización de dispositivos a BD: {e}", exc_info=True)
+    # -----------------------------------------------------------------
 
     if sites_to_process:
         await run_n8n_phase(sites_to_process)
@@ -145,12 +166,9 @@ async def run_mcp_server(stop_event: asyncio.Event):
         host=Config.MCP_HOST,
         port=Config.MCP_PORT,
         log_level="info",
-        # Deshabilitar el manejo de señales de uvicorn — lo gestiona run_all().
-        # Así Ctrl+C / SIGTERM se canalizan correctamente por nosotros.
     )
     server = uvicorn.Server(config)
-    # Desactivar el handler interno de señales de uvicorn (lo manejamos arriba).
-    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    server.install_signal_handlers = lambda: None  
 
     logger.info(f"🛰️  Arrancando MCP server en http://{Config.MCP_HOST}:{Config.MCP_PORT}")
 
@@ -160,7 +178,6 @@ async def run_mcp_server(stop_event: asyncio.Event):
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        # Pedir shutdown limpio al uvicorn server.
         server.should_exit = True
         try:
             await asyncio.wait_for(serve_task, timeout=10)
@@ -178,9 +195,9 @@ async def run_pipeline_lifecycle(stop_event: asyncio.Event):
         )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=Config.PIPELINE_INITIAL_DELAY_SECONDS)
-            return  # Stop antes de empezar.
+            return
         except asyncio.TimeoutError:
-            pass  # Timeout esperado → empezamos.
+            pass 
 
     while not stop_event.is_set():
         try:
@@ -197,7 +214,7 @@ async def run_pipeline_lifecycle(stop_event: asyncio.Event):
             await asyncio.wait_for(
                 stop_event.wait(), timeout=Config.PIPELINE_INTERVAL_SECONDS
             )
-            return  # stop_event setado mientras esperábamos.
+            return 
         except asyncio.TimeoutError:
             continue
 
@@ -220,7 +237,6 @@ async def run_all():
         try:
             loop.add_signal_handler(getattr(signal, signame), _request_stop, signame)
         except (NotImplementedError, AttributeError):
-            # Windows no soporta add_signal_handler en asyncio.
             pass
 
     tasks: list[asyncio.Task] = []
@@ -243,7 +259,6 @@ async def run_all():
             if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
                 logger.error(f"[{t.get_name()}] terminó con excepción: {r!r}")
     finally:
-        # Asegura que las tasks pendientes se cancelen al salir.
         stop_event.set()
         for t in tasks:
             if not t.done():
