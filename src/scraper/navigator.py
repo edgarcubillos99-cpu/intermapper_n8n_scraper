@@ -20,6 +20,8 @@ _ADDRESS_RE = re.compile(
 )
 # Filtro: solo procesar dispositivos cuyo nombre visible NO sea solo una IP
 _LOOKS_LIKE_IP = re.compile(r"^\s*[0-9]{1,3}(?:\.[0-9]{1,3}){3}\s*$")
+# Regex genérico para buscar IPs en textos planos
+_GENERIC_IP_RE = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
 
 class IntermapperScraper:
     def __init__(self, context):
@@ -79,7 +81,6 @@ class IntermapperScraper:
                 title = await page.title()
                 safe_name = "".join([c if c.isalnum() else "_" for c in title]).strip("_")
 
-                # Si el título está vacío por alguna razón, usamos un hash de la URL
                 if not safe_name:
                     safe_name = f"site_{hash(url)}"
 
@@ -97,14 +98,9 @@ class IntermapperScraper:
                 await page.screenshot(path=screenshot_path, full_page=True)
                 logger.info(f"📸 Captura guardada: {screenshot_path}")
 
-                tower_name = tower_name_from_screenshot_stem(screenshot_path.stem)
+                devices_ips = await self._collect_device_ips(page, final_url, tower_name_from_screenshot_stem(screenshot_path.stem))
 
-                # Reutilizamos la misma página para entrar al Device List y a
-                # cada dispositivo. Es secuencial dentro del site para no abrir
-                # docenas de pestañas en paralelo.
-                devices_ips = await self._collect_device_ips(page, final_url, tower_name)
-
-                return (tower_name, screenshot_path, final_url, devices_ips)
+                return (tower_name_from_screenshot_stem(screenshot_path.stem), screenshot_path, final_url, devices_ips)
 
             except Exception as e:
                 logger.error(f"Error procesando {url}: {e}")
@@ -113,24 +109,30 @@ class IntermapperScraper:
                 await page.close()
 
     async def _collect_device_ips(self, page, submap_url: str, tower_name: str) -> dict:
-        """Navega al device_list.html del submapa, entra a cada dispositivo con
-        enlace a !device.html y devuelve {ap_name_completo: ip}.
-
-        No falla el proceso si algún dispositivo no se puede leer; loggea y sigue.
-        """
+        """Navega al device_list.html del submapa y extrae IPs optimizadamente."""
         ip_map: dict[str, str] = {}
         try:
-            # Construimos la URL absoluta del Device List desde la URL del submapa.
             device_list_url = urljoin(submap_url, "device_list.html?REFRESH=30+Seconds")
             logger.info(f"[{tower_name}] 🔎 Abriendo Device List: {device_list_url}")
-            await page.goto(device_list_url, wait_until="domcontentloaded")
+            
+            # 1. Usar networkidle asegura que intermapper terminó de renderizar la tabla HTML.
+            await page.goto(device_list_url, wait_until="networkidle", timeout=60000)
+            
+            # 2. Pausa táctica por si el CGI de intermapper envía la tabla por fragmentos
+            await asyncio.sleep(2)
 
-            # Extraemos (nombre_visible, href_absoluto) de cada enlace de dispositivo.
-            # Los enlaces de dispositivo tienen path .../device/.../!device.html
+            # 3. Extraemos el texto completo de la fila <tr> para no tener que navegar
             devices = await page.locator("a[href*='/device/'][href*='!device.html']").evaluate_all(
-                "els => els.map(a => ({ name: (a.textContent || '').trim(), href: a.href }))"
+                """els => els.map(a => {
+                    const tr = a.closest('tr');
+                    return { 
+                        name: (a.textContent || '').trim(), 
+                        href: a.href,
+                        row_text: tr ? (tr.innerText || tr.textContent || '').trim() : ''
+                    };
+                })"""
             )
-            # Quitamos duplicados conservando el orden
+            
             seen = set()
             unique_devices = []
             for d in devices:
@@ -140,32 +142,58 @@ class IntermapperScraper:
                 seen.add(key)
                 unique_devices.append(d)
 
-            logger.info(f"[{tower_name}] {len(unique_devices)} dispositivos detectados en Device List.")
+            logger.info(f"[{tower_name}] {len(unique_devices)} dispositivos listados.")
         except Exception as e:
-            logger.warning(f"[{tower_name}] ⚠️ No se pudo abrir Device List ({e}); sin IPs para esta torre.")
+            logger.warning(f"[{tower_name}] ⚠️ No se pudo cargar Device List ({e}).")
             return ip_map
 
         for dev in unique_devices:
             ap_name = dev["name"]
             href = dev["href"]
+            row_text = dev.get("row_text", "")
 
-            if not ap_name:
-                continue
-            # Saltamos filas cuyo "nombre" es ya una IP (no son APs nombrados)
-            if _LOOKS_LIKE_IP.match(ap_name):
+            if not ap_name or _LOOKS_LIKE_IP.match(ap_name):
                 continue
 
-            try:
-                await page.goto(href, wait_until="domcontentloaded")
-                html = await page.content()
-                m = _ADDRESS_RE.search(html)
-                if m:
-                    ip = m.group(1)
-                    ip_map[ap_name] = ip
-                    logger.info(f"[{tower_name}]    └─ {ap_name} → {ip}")
-                else:
-                    logger.warning(f"[{tower_name}]    └─ {ap_name} sin Address visible en !device.html")
-            except Exception as e:
-                logger.warning(f"[{tower_name}]    └─ Error leyendo {ap_name}: {e}")
+            # --- ESTRATEGIA PRIMARIA: Buscar IP en la fila de la tabla sin navegar ---
+            found_ips = _GENERIC_IP_RE.findall(row_text)
+            # Filtramos IPs que sean exactamente el nombre del AP para evitar falsos positivos
+            valid_ips = [ip for ip in found_ips if ip != ap_name]
+            
+            if valid_ips:
+                ip = valid_ips[0]
+                ip_map[ap_name] = ip
+                logger.info(f"[{tower_name}]    └─ {ap_name} → {ip} (Lectura rápida)")
+                continue
+
+            # --- FALLBACK: Navegar al dispositivo si la IP no estaba en la tabla ---
+            # Implementamos reintentos para evitar que Intermapper colapse la conexión
+            max_retries = 3
+            success = False
+            
+            for attempt in range(max_retries):
+                try:
+                    await page.goto(href, wait_until="domcontentloaded", timeout=15000)
+                    html = await page.content()
+                    m = _ADDRESS_RE.search(html)
+                    if m:
+                        ip = m.group(1)
+                        ip_map[ap_name] = ip
+                        logger.info(f"[{tower_name}]    └─ {ap_name} → {ip}")
+                    else:
+                        logger.warning(f"[{tower_name}]    └─ {ap_name} sin IP visible en subpágina.")
+                    
+                    success = True
+                    break 
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1.5)  # Respiro antes del reintento
+                    else:
+                        logger.warning(f"[{tower_name}]    └─ Error leyendo {ap_name} tras reintentos: {e}")
+
+            # Al regresar de la subpágina no necesitamos hacer un back() 
+            # porque href siempre es una URL absoluta, pero por higiene esperamos.
+            if not success:
+                await asyncio.sleep(0.5)
 
         return ip_map

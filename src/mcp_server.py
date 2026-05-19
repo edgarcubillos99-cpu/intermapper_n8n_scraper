@@ -32,15 +32,15 @@ logger = logging.getLogger("mcp_server")
 # --- MODELO DE DATOS PARA N8N ---
 class APDeviceInfo(BaseModel):
     torre: str = Field(description="Nombre de la torre")
-    ap_name: str = Field(description="Nombre del Access Point")
-    tipo: str = Field(description="Tipo de tecnología (ePMP, Rocket AC, etc)")
-    azimut: str = Field(description="Dirección en grados")
-    tilt: str = Field(description="Inclinación del equipo")
-    altura: str = Field(description="Altura en pies (Ft)")
+    torre_latitud: str | None = Field(default=None, description="Latitud de la torre")
+    torre_longitud: str | None = Field(default=None, description="Longitud de la torre")
+    # Los siguientes campos ahora son opcionales/tienen valor por defecto vacío
+    ap_name: str | None = Field(default="", description="Nombre del Access Point")
+    tipo: str | None = Field(default="", description="Tipo de tecnología (ePMP, Rocket AC, etc)")
+    azimut: str | None = Field(default="", description="Dirección en grados")
+    tilt: str | None = Field(default="", description="Inclinación del equipo")
+    altura: str | None = Field(default="", description="Altura en pies (Ft)")
 
-
-# Esquema inline (sin $ref/$defs): Google Gemini exige `type: array` + `items`
-# y rechaza o pierde `items` si solo queda una referencia que el cliente no resuelve.
 _APS_DATA_JSON_SCHEMA = {
     "type": "array",
     "description": "Lista de APs detectados en el mapa Intermapper para sincronizar.",
@@ -48,16 +48,16 @@ _APS_DATA_JSON_SCHEMA = {
         "type": "object",
         "properties": {
             "torre": {"type": "string", "description": "Nombre de la torre"},
+            "torre_latitud": {"type": "string", "description": "Latitud de la torre"},
+            "torre_longitud": {"type": "string", "description": "Longitud de la torre"},
             "ap_name": {"type": "string", "description": "Nombre del Access Point"},
-            "tipo": {
-                "type": "string",
-                "description": "Tipo de tecnología (ePMP, Rocket AC, etc)",
-            },
+            "tipo": {"type": "string", "description": "Tipo de tecnología"},
             "azimut": {"type": "string", "description": "Dirección en grados"},
             "tilt": {"type": "string", "description": "Inclinación del equipo"},
             "altura": {"type": "string", "description": "Altura en pies (Ft)"},
         },
-        "required": ["torre", "ap_name", "tipo", "azimut", "tilt", "altura"],
+        # AHORA SOLO LA TORRE ES ESTRICTAMENTE OBLIGATORIA
+        "required": ["torre"], 
     },
 }
 
@@ -185,6 +185,31 @@ def _ensure_ip_address_column(connection) -> None:
             )
     connection.commit()
 
+def _ensure_torres_columns(connection) -> None:
+    """ALTER TABLE para añadir `latitud` y `longitud` a torres si no existen.
+    Idempotente: si las columnas ya están, no hace nada.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS c
+              FROM information_schema.columns
+             WHERE table_schema = DATABASE()
+               AND table_name   = 'torres'
+               AND column_name  = 'latitud'
+            """
+        )
+        row = cursor.fetchone()
+        already = (row or {}).get("c", 0)
+        if not already:
+            logger.info("Columnas latitud/longitud no existen en 'torres'; ejecutando ALTER TABLE.")
+            cursor.execute(
+                "ALTER TABLE torres "
+                "ADD COLUMN latitud VARCHAR(50) NULL AFTER nombre, "
+                "ADD COLUMN longitud VARCHAR(50) NULL AFTER latitud"
+            )
+    connection.commit()
+
 
 @mcp.tool()
 def sync_intermapper_data(
@@ -192,54 +217,61 @@ def sync_intermapper_data(
 ) -> str:
     """
     Sincroniza los datos extraídos de Intermapper en las tablas 'torres' y 'dispositivos_ap'.
-
-    Además de los campos enviados por n8n, completa `ip_address` haciendo lookup
-    en ip_map.json (generado por la fase 1 del scraper). El match entre el
-    `ap_name` de n8n y el nombre que aparece en Intermapper es por token prefijo
-    (case-insensitive), p.ej. 'OSNAP22-A' coincide con 'OSNAP22-A (Lite AC)'.
     """
     connection = get_db_connection()
     try:
         _ensure_ip_address_column(connection)
+        _ensure_torres_columns(connection) # <--- LLAMADA A LA NUEVA FUNCIÓN
         ip_map = _load_ip_map()
         ips_aplicadas = 0
         ips_no_encontradas: list[str] = []
 
         with connection.cursor() as cursor:
             for ap in aps_data:
-                cursor.execute("INSERT IGNORE INTO torres (nombre) VALUES (%s)", (ap.torre,))
-
-                ip_address = _lookup_ip(ip_map, ap.torre, ap.ap_name)
-                if ip_address:
-                    ips_aplicadas += 1
-                else:
-                    ips_no_encontradas.append(f"{ap.torre}/{ap.ap_name}")
-
-                # COALESCE(VALUES(ip_address), ip_address) preserva la IP existente
-                # si en este sync no se pudo determinar una nueva.
-                sql_upsert = """
-                    INSERT INTO dispositivos_ap
-                        (torre_nombre, ap_name, tipo, azimut, tilt, altura, ip_address)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                # 1. ACTUALIZAR TORRE Y COORDENADAS (Se ejecuta SIEMPRE)
+                sql_torre = """
+                    INSERT INTO torres (nombre, latitud, longitud)
+                    VALUES (%s, %s, %s)
                     ON DUPLICATE KEY UPDATE
-                        tipo       = VALUES(tipo),
-                        azimut     = VALUES(azimut),
-                        tilt       = VALUES(tilt),
-                        altura     = VALUES(altura),
-                        ip_address = COALESCE(VALUES(ip_address), ip_address)
+                        latitud = COALESCE(NULLIF(VALUES(latitud), ''), latitud),
+                        longitud = COALESCE(NULLIF(VALUES(longitud), ''), longitud)
                 """
-                cursor.execute(
-                    sql_upsert,
-                    (
-                        ap.torre,
-                        ap.ap_name,
-                        ap.tipo,
-                        ap.azimut,
-                        ap.tilt,
-                        ap.altura,
-                        ip_address,
-                    ),
-                )
+                cursor.execute(sql_torre, (ap.torre, ap.torre_latitud, ap.torre_longitud))
+
+                # Limpiamos el nombre por si el LLM manda espacios en blanco
+                ap_name_clean = (ap.ap_name or "").strip()
+
+                # 2. ACTUALIZAR DISPOSITIVOS_AP (Solo se ejecuta si hay un nombre de AP válido)
+                if ap_name_clean:
+                    ip_address = _lookup_ip(ip_map, ap.torre, ap_name_clean)
+                    if ip_address:
+                        ips_aplicadas += 1
+                    else:
+                        ips_no_encontradas.append(f"{ap.torre}/{ap_name_clean}")
+
+                    sql_upsert = """
+                        INSERT INTO dispositivos_ap
+                            (torre_nombre, ap_name, tipo, azimut, tilt, altura, ip_address)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            tipo       = VALUES(tipo),
+                            azimut     = VALUES(azimut),
+                            tilt       = VALUES(tilt),
+                            altura     = VALUES(altura),
+                            ip_address = COALESCE(VALUES(ip_address), ip_address)
+                    """
+                    cursor.execute(
+                        sql_upsert,
+                        (
+                            ap.torre,
+                            ap_name_clean,
+                            ap.tipo,
+                            ap.azimut,
+                            ap.tilt,
+                            ap.altura,
+                            ip_address,
+                        ),
+                    )
 
         connection.commit()
 

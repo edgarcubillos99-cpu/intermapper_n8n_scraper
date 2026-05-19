@@ -9,6 +9,8 @@ _DDL_TORRES = """
 CREATE TABLE IF NOT EXISTS torres (
     id INT NOT NULL AUTO_INCREMENT,
     nombre VARCHAR(150) NOT NULL,
+    latitud VARCHAR(50) NULL,
+    longitud VARCHAR(50) NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_torres_nombre (nombre)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
