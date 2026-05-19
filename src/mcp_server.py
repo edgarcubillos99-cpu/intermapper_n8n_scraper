@@ -210,6 +210,31 @@ def _ensure_torres_columns(connection) -> None:
             )
     connection.commit()
 
+def _ensure_disp_id_column(connection) -> None:
+    """ALTER TABLE para añadir `disp_id` y su FK a dispositivos_ap si no existen.
+    Idempotente: previene fallos si las columnas ya fueron creadas.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS c
+              FROM information_schema.columns
+             WHERE table_schema = DATABASE()
+               AND table_name   = 'dispositivos_ap'
+               AND column_name  = 'disp_id'
+            """
+        )
+        row = cursor.fetchone()
+        already = (row or {}).get("c", 0)
+        if not already:
+            logger.info("Columna 'disp_id' no existe en 'dispositivos_ap'; ejecutando ALTER TABLE relacional.")
+            cursor.execute(
+                "ALTER TABLE dispositivos_ap "
+                "ADD COLUMN disp_id INT NULL AFTER id, "
+                "ADD CONSTRAINT fk_dispositivos_ap_disp FOREIGN KEY (disp_id) "
+                "REFERENCES dispositivos (id) ON DELETE SET NULL"
+            )
+    connection.commit()
 
 @mcp.tool()
 def sync_intermapper_data(
@@ -221,14 +246,15 @@ def sync_intermapper_data(
     connection = get_db_connection()
     try:
         _ensure_ip_address_column(connection)
-        _ensure_torres_columns(connection) # <--- LLAMADA A LA NUEVA FUNCIÓN
+        _ensure_torres_columns(connection)
+        _ensure_disp_id_column(connection) # <--- MIGRACIÓN AUTOMÁTICA DE LA NUEVA COLUMNA
         ip_map = _load_ip_map()
         ips_aplicadas = 0
         ips_no_encontradas: list[str] = []
 
         with connection.cursor() as cursor:
             for ap in aps_data:
-                # 1. ACTUALIZAR TORRE Y COORDENADAS (Se ejecuta SIEMPRE)
+                # 1. ACTUALIZAR TORRE Y COORDENADAS
                 sql_torre = """
                     INSERT INTO torres (nombre, latitud, longitud)
                     VALUES (%s, %s, %s)
@@ -238,22 +264,48 @@ def sync_intermapper_data(
                 """
                 cursor.execute(sql_torre, (ap.torre, ap.torre_latitud, ap.torre_longitud))
 
-                # Limpiamos el nombre por si el LLM manda espacios en blanco
                 ap_name_clean = (ap.ap_name or "").strip()
 
-                # 2. ACTUALIZAR DISPOSITIVOS_AP (Solo se ejecuta si hay un nombre de AP válido)
+                # 2. ACTUALIZAR DISPOSITIVOS_AP (Solo si viene con un nombre de AP válido)
                 if ap_name_clean:
+                    # --- 2.1 OBTENER IP PRIMERO ---
+                    # Aprovechamos tu función que maneja variaciones en el nombre
                     ip_address = _lookup_ip(ip_map, ap.torre, ap_name_clean)
                     if ip_address:
                         ips_aplicadas += 1
                     else:
                         ips_no_encontradas.append(f"{ap.torre}/{ap_name_clean}")
 
+                    # --- 2.2 BUSCAR ID RELACIONAL (Priorizando la IP) ---
+                    disp_id = None
+                    if ip_address:
+                        # Si tenemos IP, es el método más exacto para cruzar la tabla
+                        cursor.execute(
+                            "SELECT id FROM dispositivos WHERE torre = %s AND ip_address = %s LIMIT 1",
+                            (ap.torre, ip_address)
+                        )
+                        row_disp = cursor.fetchone()
+                        if row_disp:
+                            disp_id = row_disp.get("id")
+                    
+                    # Fallback por si acaso no tenía IP pero el nombre coincide exactamente
+                    if not disp_id:
+                        cursor.execute(
+                            "SELECT id FROM dispositivos WHERE torre = %s AND dispositivo = %s LIMIT 1",
+                            (ap.torre, ap_name_clean)
+                        )
+                        row_disp = cursor.fetchone()
+                        if row_disp:
+                            disp_id = row_disp.get("id")
+                    # ---------------------------------------------------
+
+                    # --- 2.3 INSERTAR EN DISPOSITIVOS_AP ---
                     sql_upsert = """
                         INSERT INTO dispositivos_ap
-                            (torre_nombre, ap_name, tipo, azimut, tilt, altura, ip_address)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            (disp_id, torre_nombre, ap_name, tipo, azimut, tilt, altura, ip_address)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE
+                            disp_id    = VALUES(disp_id),
                             tipo       = VALUES(tipo),
                             azimut     = VALUES(azimut),
                             tilt       = VALUES(tilt),
@@ -263,6 +315,7 @@ def sync_intermapper_data(
                     cursor.execute(
                         sql_upsert,
                         (
+                            disp_id,
                             ap.torre,
                             ap_name_clean,
                             ap.tipo,
