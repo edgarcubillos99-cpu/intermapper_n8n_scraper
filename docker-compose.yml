@@ -22,6 +22,12 @@ services:
     # Permite que el contenedor alcance servicios del host (MySQL local, n8n local, etc.)
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Si el contenedor muere con exit 137 (OOM) tras muchas torres + n8n en paralelo,
+    # sube memoria del host o reduce CONCURRENT_WORKERS en .env.
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 4G
     healthcheck:
       test:
         - "CMD"

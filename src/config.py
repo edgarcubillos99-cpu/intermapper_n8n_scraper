@@ -32,6 +32,9 @@ class Config:
     IP_MAP_PATH = DATA_DIR / "ip_map.json"
 
     WORKERS = int(os.getenv("CONCURRENT_WORKERS", "3"))
+    # Reintentos por site si falla navegación o captura (estabilidad del ip_map).
+    SITE_PROCESS_RETRIES = int(os.getenv("SITE_PROCESS_RETRIES", "2"))
+    DEVICE_LIST_TIMEOUT_MS = int(os.getenv("DEVICE_LIST_TIMEOUT_MS", "90000"))
 
     # --- Base de datos ---
     DB_HOST = os.getenv("DB_HOST")

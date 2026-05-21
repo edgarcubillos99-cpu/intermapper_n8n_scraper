@@ -13,15 +13,18 @@ from src.scraper.tower_naming import (
 
 logger = get_logger(__name__)
 
-# Regex para extraer la IPv4 que aparece tras el label "Address:" en !device.html
 _ADDRESS_RE = re.compile(
     r"Address:\s*</font>\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
     re.IGNORECASE,
 )
-# Filtro: solo procesar dispositivos cuyo nombre visible NO sea solo una IP
 _LOOKS_LIKE_IP = re.compile(r"^\s*[0-9]{1,3}(?:\.[0-9]{1,3}){3}\s*$")
-# Regex genérico para buscar IPs en textos planos
 _GENERIC_IP_RE = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
+
+_DEVICE_LINK_SELECTORS = (
+    "a[href*='/device/'][href*='!device.html']",
+    "a[href*='!device.html']",
+)
+
 
 class IntermapperScraper:
     def __init__(self, context):
@@ -34,11 +37,10 @@ class IntermapperScraper:
         try:
             logger.info("Navegando al mapa principal (Autenticación automática en proceso)...")
             await page.goto(self.base_url, wait_until="networkidle")
-            
-            # Verificamos que cargó el mapa buscando el id="imap"
+
             await page.wait_for_selector("map#imap", state="attached", timeout=10000)
             logger.info("Acceso confirmado. Mapa principal cargado.")
-            
+
             return page
         except Exception as e:
             logger.error(f"Error al acceder al mapa principal: {e}")
@@ -46,43 +48,62 @@ class IntermapperScraper:
             raise
 
     async def get_site_links(self, page):
-        """Extrae los href de las áreas del mapa."""
+        """Extrae sites del mapa principal con href y etiqueta (title/alt), ordenados."""
         logger.info("Extrayendo enlaces de los sites desde <map id='imap'>...")
-        
-        # En JavaScript, 'el.href' devuelve la URL absoluta, resolviendo la ruta relativa
-        links = await page.locator("map#imap area").evaluate_all(
-            "elements => elements.map(el => el.href)"
+
+        sites = await page.locator("map#imap area").evaluate_all(
+            """elements => elements.map(el => ({
+                href: el.href,
+                label: (el.getAttribute('title') || el.getAttribute('alt') || '').trim()
+            }))"""
         )
-        
-        unique_links = list(set(links))
-        logger.info(f"Se encontraron {len(unique_links)} sites para procesar.")
-        return unique_links
 
-    async def process_site(self, url, semaphore):
-        """Navega a un site específico, toma la captura y recolecta IPs de sus
-        dispositivos. Devuelve (torre, ruta_png, url, devices_ip_dict) o None.
+        seen_hrefs: set[str] = set()
+        unique_sites: list[dict] = []
+        for site in sites:
+            href = (site.get("href") or "").strip()
+            if not href or href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            unique_sites.append({"href": href, "label": site.get("label") or ""})
 
-        devices_ip_dict tiene la forma {ap_name_completo: ip_address}.
+        unique_sites.sort(key=lambda s: s["href"])
+        logger.info(f"Se encontraron {len(unique_sites)} sites para procesar.")
+        return unique_sites
+
+    def _tower_name_candidates(self, page_title: str, area_label: str, screenshot_stem: str) -> str:
+        """Elige el nombre de torre más estable entre título de página, área del mapa y archivo."""
+        from_stem = tower_name_from_screenshot_stem(screenshot_stem)
+        label = (area_label or "").strip()
+        title = re.sub(r"^(Map and Charts|Map)\s*[-–—:]\s*", "", page_title or "", flags=re.I).strip()
+        title = title.replace("_", " ").strip()
+
+        for candidate in (label, title, from_stem):
+            if candidate and len(candidate) >= 2:
+                return candidate[:150]
+        return from_stem
+
+    async def process_site(self, site_info: dict, semaphore):
+        """Navega a un site, captura pantalla y recolecta IPs.
+
+        site_info: {"href": str, "label": str}
+        Devuelve (torre, ruta_png, url, devices_ip_dict) o None.
         """
+        url = site_info["href"]
+        area_label = site_info.get("label") or ""
+
         async with semaphore:
             page = await self.context.new_page()
             try:
-                # Bloquear imágenes de fondo del propio Intermapper si las hay para ahorrar RAM
-                await page.route("**/*.{png,jpg,jpeg}", lambda route: route.continue_())
-
                 logger.info(f"Navegando al site: {url}")
-
-                # Intermapper nos redirigirá a la URL completa del submapa.
-                await page.goto(url, wait_until="networkidle")
-
-                # Le damos 2 segundos extra para que los nodos SVG/iconos terminen de renderizar
+                await page.goto(url, wait_until="networkidle", timeout=90000)
+                await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(2)
 
                 title = await page.title()
                 safe_name = "".join([c if c.isalnum() else "_" for c in title]).strip("_")
-
                 if not safe_name:
-                    safe_name = f"site_{hash(url)}"
+                    safe_name = f"site_{abs(hash(url)) % 10**8}"
 
                 if len(safe_name) > MAX_SCREENSHOT_STEM_BASE:
                     safe_name = safe_name[:MAX_SCREENSHOT_STEM_BASE].rstrip("_")
@@ -98,9 +119,12 @@ class IntermapperScraper:
                 await page.screenshot(path=screenshot_path, full_page=True)
                 logger.info(f"📸 Captura guardada: {screenshot_path}")
 
-                devices_ips = await self._collect_device_ips(page, final_url, tower_name_from_screenshot_stem(screenshot_path.stem))
+                tower_name = self._tower_name_candidates(
+                    title, area_label, screenshot_path.stem
+                )
+                devices_ips = await self._collect_device_ips(page, final_url, tower_name)
 
-                return (tower_name_from_screenshot_stem(screenshot_path.stem), screenshot_path, final_url, devices_ips)
+                return (tower_name, screenshot_path, final_url, devices_ips)
 
             except Exception as e:
                 logger.error(f"Error procesando {url}: {e}")
@@ -109,32 +133,38 @@ class IntermapperScraper:
                 await page.close()
 
     async def _collect_device_ips(self, page, submap_url: str, tower_name: str) -> dict:
-        """Navega al device_list.html del submapa y extrae IPs optimizadamente."""
+        """Navega al device_list.html del submapa y extrae IPs de forma estable."""
         ip_map: dict[str, str] = {}
+        device_list_url = urljoin(submap_url, "device_list.html?REFRESH=30+Seconds")
+
         try:
-            device_list_url = urljoin(submap_url, "device_list.html?REFRESH=30+Seconds")
             logger.info(f"[{tower_name}] 🔎 Abriendo Device List: {device_list_url}")
-            
-            # 1. Usar networkidle asegura que intermapper terminó de renderizar la tabla HTML.
-            await page.goto(device_list_url, wait_until="networkidle", timeout=60000)
-            
-            # 2. Pausa táctica por si el CGI de intermapper envía la tabla por fragmentos
+            await page.goto(
+                device_list_url,
+                wait_until="networkidle",
+                timeout=Config.DEVICE_LIST_TIMEOUT_MS,
+            )
+            await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(2)
 
-            # 3. Extraemos el texto completo de la fila <tr> para no tener que navegar
-            devices = await page.locator("a[href*='/device/'][href*='!device.html']").evaluate_all(
-                """els => els.map(a => {
-                    const tr = a.closest('tr');
-                    return { 
-                        name: (a.textContent || '').trim(), 
-                        href: a.href,
-                        row_text: tr ? (tr.innerText || tr.textContent || '').trim() : ''
-                    };
-                })"""
-            )
-            
-            seen = set()
-            unique_devices = []
+            devices: list[dict] = []
+            for selector in _DEVICE_LINK_SELECTORS:
+                found = await page.locator(selector).evaluate_all(
+                    """els => els.map(a => {
+                        const tr = a.closest('tr');
+                        return {
+                            name: (a.textContent || '').trim(),
+                            href: a.href,
+                            row_text: tr ? (tr.innerText || tr.textContent || '').trim() : ''
+                        };
+                    })"""
+                )
+                if found:
+                    devices = found
+                    break
+
+            seen: set[tuple[str, str]] = set()
+            unique_devices: list[dict] = []
             for d in devices:
                 key = (d["name"], d["href"])
                 if key in seen:
@@ -155,45 +185,41 @@ class IntermapperScraper:
             if not ap_name or _LOOKS_LIKE_IP.match(ap_name):
                 continue
 
-            # --- ESTRATEGIA PRIMARIA: Buscar IP en la fila de la tabla sin navegar ---
             found_ips = _GENERIC_IP_RE.findall(row_text)
-            # Filtramos IPs que sean exactamente el nombre del AP para evitar falsos positivos
             valid_ips = [ip for ip in found_ips if ip != ap_name]
-            
+
             if valid_ips:
-                ip = valid_ips[0]
-                ip_map[ap_name] = ip
-                logger.info(f"[{tower_name}]    └─ {ap_name} → {ip} (Lectura rápida)")
+                ip_map[ap_name] = valid_ips[0]
+                logger.info(f"[{tower_name}]    └─ {ap_name} → {valid_ips[0]} (tabla)")
                 continue
 
-            # --- FALLBACK: Navegar al dispositivo si la IP no estaba en la tabla ---
-            # Implementamos reintentos para evitar que Intermapper colapse la conexión
             max_retries = 3
-            success = False
-            
             for attempt in range(max_retries):
                 try:
-                    await page.goto(href, wait_until="domcontentloaded", timeout=15000)
+                    await page.goto(href, wait_until="domcontentloaded", timeout=20000)
                     html = await page.content()
                     m = _ADDRESS_RE.search(html)
                     if m:
-                        ip = m.group(1)
-                        ip_map[ap_name] = ip
-                        logger.info(f"[{tower_name}]    └─ {ap_name} → {ip}")
+                        ip_map[ap_name] = m.group(1)
+                        logger.info(f"[{tower_name}]    └─ {ap_name} → {m.group(1)}")
                     else:
-                        logger.warning(f"[{tower_name}]    └─ {ap_name} sin IP visible en subpágina.")
-                    
-                    success = True
-                    break 
+                        logger.warning(f"[{tower_name}]    └─ {ap_name} sin IP en subpágina.")
+                    break
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(1.5)  # Respiro antes del reintento
+                        await asyncio.sleep(1.5)
                     else:
-                        logger.warning(f"[{tower_name}]    └─ Error leyendo {ap_name} tras reintentos: {e}")
+                        logger.warning(
+                            f"[{tower_name}]    └─ Error leyendo {ap_name} tras reintentos: {e}"
+                        )
 
-            # Al regresar de la subpágina no necesitamos hacer un back() 
-            # porque href siempre es una URL absoluta, pero por higiene esperamos.
-            if not success:
-                await asyncio.sleep(0.5)
+            try:
+                await page.goto(
+                    device_list_url,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+            except Exception:
+                pass
 
         return ip_map

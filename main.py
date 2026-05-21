@@ -14,6 +14,7 @@ Variables de control (en `.env` o entorno):
 """
 import asyncio
 import json
+import os
 import signal
 import time
 from pathlib import Path
@@ -41,17 +42,39 @@ async def run_scraper_phase():
     scraper = IntermapperScraper(context)
     page = await scraper.login()
 
-    urls = await scraper.get_site_links(page)
+    sites = await scraper.get_site_links(page)
     await page.close()
 
     semaphore = asyncio.Semaphore(Config.WORKERS)
 
-    tasks = [scraper.process_site(url, semaphore) for url in urls]
+    async def _process_with_retries(site_info: dict):
+        last_err = None
+        for attempt in range(1, Config.SITE_PROCESS_RETRIES + 2):
+            result = await scraper.process_site(site_info, semaphore)
+            if result is not None:
+                return result
+            last_err = site_info.get("href")
+            if attempt <= Config.SITE_PROCESS_RETRIES:
+                wait_s = min(2 * attempt, 8)
+                logger.warning(
+                    f"Reintento {attempt}/{Config.SITE_PROCESS_RETRIES} para site {last_err} "
+                    f"(espera {wait_s}s)"
+                )
+                await asyncio.sleep(wait_s)
+        logger.error(f"Site descartado tras reintentos: {last_err}")
+        return None
+
+    tasks = [_process_with_retries(site) for site in sites]
     results = await asyncio.gather(*tasks)
 
     await browser_manager.stop()
 
     sites_to_process = [r for r in results if r is not None]
+    failed = len(sites) - len(sites_to_process)
+    if failed:
+        logger.warning(
+            f"{failed}/{len(sites)} sites no se procesaron (revisa logs de red/timeout)."
+        )
 
     # Fallback: si el scraping en vivo falló pero hay screenshots locales.
     if not sites_to_process:
@@ -62,25 +85,53 @@ async def run_scraper_phase():
     return sites_to_process
 
 
+def _load_existing_ip_map() -> dict[str, dict[str, str]]:
+    if not Config.IP_MAP_PATH.exists():
+        return {}
+    try:
+        data = json.loads(Config.IP_MAP_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning(f"No se pudo leer ip_map.json previo ({e}); se creará uno nuevo.")
+        return {}
+
+
 def persist_ip_map(sites_to_process: list) -> dict:
-    """Escribe {torre: {ap_name: ip}} a Config.IP_MAP_PATH y devuelve el diccionario."""
-    ip_map: dict[str, dict[str, str]] = {}
+    """Fusiona {torre: {ap_name: ip}} con el archivo previo y escribe ip_map.json."""
+    ip_map: dict[str, dict[str, str]] = _load_existing_ip_map()
+    torres_esta_corrida = 0
+    torres_sin_ips = 0
+
     for tower_name, _path, _url, devices in sites_to_process:
-        if not devices:
-            continue
-        ip_map.setdefault(tower_name, {}).update(devices)
+        torres_esta_corrida += 1
+        bucket = ip_map.setdefault(tower_name, {})
+        if devices:
+            bucket.update(devices)
+        else:
+            torres_sin_ips += 1
+
+    sorted_map = {
+        torre: dict(sorted(dispositivos.items()))
+        for torre, dispositivos in sorted(ip_map.items(), key=lambda x: x[0].lower())
+    }
 
     Config.IP_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
     Config.IP_MAP_PATH.write_text(
-        json.dumps(ip_map, indent=2, ensure_ascii=False),
+        json.dumps(sorted_map, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    total_ips = sum(len(v) for v in ip_map.values())
+    try:
+        from src.mcp_sync import invalidate_ip_map_cache
+        invalidate_ip_map_cache()
+    except Exception:
+        pass
+    total_ips = sum(len(v) for v in sorted_map.values())
     logger.info(
         f"💾 ip_map.json escrito en {Config.IP_MAP_PATH} "
-        f"({len(ip_map)} torres, {total_ips} IPs)."
+        f"({len(sorted_map)} torres, {total_ips} IPs; "
+        f"esta corrida: {torres_esta_corrida} torres, {torres_sin_ips} sin IPs nuevas)."
     )
-    return ip_map
+    return sorted_map
 
 
 async def run_n8n_phase(sites_to_process: list):
@@ -166,6 +217,8 @@ async def run_mcp_server(stop_event: asyncio.Event):
         host=Config.MCP_HOST,
         port=Config.MCP_PORT,
         log_level="info",
+        timeout_keep_alive=30,
+        limit_concurrency=int(os.getenv("MCP_LIMIT_CONCURRENCY", "80")),
     )
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  
