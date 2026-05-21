@@ -34,16 +34,19 @@ class APDeviceInfo(BaseModel):
     torre: str = Field(description="Nombre de la torre")
     torre_latitud: str | None = Field(default=None, description="Latitud de la torre")
     torre_longitud: str | None = Field(default=None, description="Longitud de la torre")
-    # Los siguientes campos ahora son opcionales/tienen valor por defecto vacío
     ap_name: str | None = Field(default="", description="Nombre del Access Point")
     tipo: str | None = Field(default="", description="Tipo de tecnología (ePMP, Rocket AC, etc)")
     azimut: str | None = Field(default="", description="Dirección en grados")
     tilt: str | None = Field(default="", description="Inclinación del equipo")
     altura: str | None = Field(default="", description="Altura en pies (Ft)")
+    contacto1: str | None = Field(default="", description="Primer contacto o teléfono en el plano")
+    contacto2: str | None = Field(default="", description="Segundo contacto o teléfono en el plano")
+    contacto3: str | None = Field(default="", description="Tercer contacto o teléfono en el plano")
+    contacto4: str | None = Field(default="", description="Cuarto contacto o teléfono en el plano")
 
 _APS_DATA_JSON_SCHEMA = {
     "type": "array",
-    "description": "Lista de APs detectados en el mapa Intermapper para sincronizar.",
+    "description": "Lista de APs y metadatos de la torre detectados en el mapa Intermapper.",
     "items": {
         "type": "object",
         "properties": {
@@ -55,8 +58,11 @@ _APS_DATA_JSON_SCHEMA = {
             "azimut": {"type": "string", "description": "Dirección en grados"},
             "tilt": {"type": "string", "description": "Inclinación del equipo"},
             "altura": {"type": "string", "description": "Altura en pies (Ft)"},
+            "contacto1": {"type": "string", "description": "Contacto 1"},
+            "contacto2": {"type": "string", "description": "Contacto 2"},
+            "contacto3": {"type": "string", "description": "Contacto 3"},
+            "contacto4": {"type": "string", "description": "Contacto 4"},
         },
-        # AHORA SOLO LA TORRE ES ESTRICTAMENTE OBLIGATORIA
         "required": ["torre"], 
     },
 }
@@ -236,6 +242,25 @@ def _ensure_disp_id_column(connection) -> None:
             )
     connection.commit()
 
+def _ensure_contactos_table_runtime(connection) -> None:
+    """Asegura la creación de la tabla contactos en caliente si no se reinició el esquema."""
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS contactos (
+                id INT NOT NULL AUTO_INCREMENT,
+                id_torre INT NOT NULL,
+                torre VARCHAR(150) NOT NULL,
+                contacto1 VARCHAR(150) NULL,
+                contacto2 VARCHAR(150) NULL,
+                contacto3 VARCHAR(150) NULL,
+                contacto4 VARCHAR(150) NULL,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_contactos_id_torre (id_torre),
+                CONSTRAINT fk_contactos_torres FOREIGN KEY (id_torre) REFERENCES torres (id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+    connection.commit()
+
 @mcp.tool()
 def sync_intermapper_data(
     aps_data: Annotated[List[APDeviceInfo], WithJsonSchema(_APS_DATA_JSON_SCHEMA)],
@@ -247,7 +272,8 @@ def sync_intermapper_data(
     try:
         _ensure_ip_address_column(connection)
         _ensure_torres_columns(connection)
-        _ensure_disp_id_column(connection) # <--- MIGRACIÓN AUTOMÁTICA DE LA NUEVA COLUMNA
+        _ensure_disp_id_column(connection)
+        _ensure_contactos_table_runtime(connection) # <--- Ejecuta la verificación de la tabla contactos
         ip_map = _load_ip_map()
         ips_aplicadas = 0
         ips_no_encontradas: list[str] = []
@@ -264,22 +290,46 @@ def sync_intermapper_data(
                 """
                 cursor.execute(sql_torre, (ap.torre, ap.torre_latitud, ap.torre_longitud))
 
+                # Extraer el ID de la torre para asegurar la sincronización relacional de contactos
+                cursor.execute("SELECT id FROM torres WHERE nombre = %s", (ap.torre,))
+                row_torre = cursor.fetchone()
+                id_torre = row_torre.get("id") if row_torre else None
+
+                # 2. GUARDAR CONTACTOS EXTRAÍDOS EN SU RESPECTIVA TORRE (Idempotente)
+                if id_torre:
+                    sql_contactos = """
+                        INSERT INTO contactos (id_torre, torre, contacto1, contacto2, contacto3, contacto4)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            contacto1 = COALESCE(NULLIF(VALUES(contacto1), ''), contacto1),
+                            contacto2 = COALESCE(NULLIF(VALUES(contacto2), ''), contacto2),
+                            contacto3 = COALESCE(NULLIF(VALUES(contacto3), ''), contacto3),
+                            contacto4 = COALESCE(NULLIF(VALUES(contacto4), ''), contacto4)
+                    """
+                    cursor.execute(
+                        sql_contactos,
+                        (
+                            id_torre,
+                            ap.torre,
+                            (ap.contacto1 or "").strip(),
+                            (ap.contacto2 or "").strip(),
+                            (ap.contacto3 or "").strip(),
+                            (ap.contacto4 or "").strip(),
+                        ),
+                    )
+
                 ap_name_clean = (ap.ap_name or "").strip()
 
-                # 2. ACTUALIZAR DISPOSITIVOS_AP (Solo si viene con un nombre de AP válido)
+                # 3. ACTUALIZAR DISPOSITIVOS_AP (Solo si viene con un nombre de AP válido)
                 if ap_name_clean:
-                    # --- 2.1 OBTENER IP PRIMERO ---
-                    # Aprovechamos tu función que maneja variaciones en el nombre
                     ip_address = _lookup_ip(ip_map, ap.torre, ap_name_clean)
                     if ip_address:
                         ips_aplicadas += 1
                     else:
                         ips_no_encontradas.append(f"{ap.torre}/{ap_name_clean}")
 
-                    # --- 2.2 BUSCAR ID RELACIONAL (Priorizando la IP) ---
                     disp_id = None
                     if ip_address:
-                        # Si tenemos IP, es el método más exacto para cruzar la tabla
                         cursor.execute(
                             "SELECT id FROM dispositivos WHERE torre = %s AND ip_address = %s LIMIT 1",
                             (ap.torre, ip_address)
@@ -288,7 +338,6 @@ def sync_intermapper_data(
                         if row_disp:
                             disp_id = row_disp.get("id")
                     
-                    # Fallback por si acaso no tenía IP pero el nombre coincide exactamente
                     if not disp_id:
                         cursor.execute(
                             "SELECT id FROM dispositivos WHERE torre = %s AND dispositivo = %s LIMIT 1",
@@ -297,9 +346,7 @@ def sync_intermapper_data(
                         row_disp = cursor.fetchone()
                         if row_disp:
                             disp_id = row_disp.get("id")
-                    # ---------------------------------------------------
 
-                    # --- 2.3 INSERTAR EN DISPOSITIVOS_AP ---
                     sql_upsert = """
                         INSERT INTO dispositivos_ap
                             (disp_id, torre_nombre, ap_name, tipo, azimut, tilt, altura, ip_address)
