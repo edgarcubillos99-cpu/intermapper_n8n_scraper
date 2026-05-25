@@ -75,21 +75,75 @@ MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 MCP_MAX_CONCURRENT_SYNCS = int(os.getenv("MCP_MAX_CONCURRENT_SYNCS", "6"))
 MCP_ALLOWED_HOSTS = os.getenv("MCP_ALLOWED_HOSTS", "").strip()
-MCP_ENABLE_SSE = os.getenv("MCP_ENABLE_SSE", "true").strip().lower() in {"1", "true", "yes", "on"}
+MCP_ENABLE_SSE = os.getenv("MCP_ENABLE_SSE", "false").strip().lower() in {"1", "true", "yes", "on"}
 MCP_ENABLE_STREAMABLE = os.getenv("MCP_ENABLE_STREAMABLE", "true").strip().lower() in {
     "1", "true", "yes", "on"
 }
+# Stateless: cada petición HTTP es independiente (recomendado para n8n, que abre sesión por llamada).
+MCP_STATELESS_HTTP = os.getenv("MCP_STATELESS_HTTP", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+MCP_JSON_RESPONSE = os.getenv("MCP_JSON_RESPONSE", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+# Solo aplica en modo stateful; cierra sesiones SSE inactivas (evita fugas de conexiones).
+MCP_SESSION_IDLE_TIMEOUT_RAW = os.getenv("MCP_SESSION_IDLE_TIMEOUT", "120").strip()
 
-mcp = FastMCP("Intermapper_Sync_Service")
+mcp = FastMCP(
+    "Intermapper_Sync_Service",
+    stateless_http=MCP_STATELESS_HTTP,
+    json_response=MCP_JSON_RESPONSE,
+)
 
 _streamable_app: Starlette | None = None
 _sse_app: Starlette | None = None
+
+
+def _parse_session_idle_timeout() -> float | None:
+    if MCP_STATELESS_HTTP or not MCP_SESSION_IDLE_TIMEOUT_RAW:
+        return None
+    try:
+        value = float(MCP_SESSION_IDLE_TIMEOUT_RAW)
+    except ValueError:
+        logger.warning(
+            "MCP_SESSION_IDLE_TIMEOUT inválido (%r); sin expiración de sesiones.",
+            MCP_SESSION_IDLE_TIMEOUT_RAW,
+        )
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _configure_streamable_session_manager() -> None:
+    """Aplica session_idle_timeout al manager (FastMCP no lo expone en Settings)."""
+    sm = mcp._session_manager
+    if sm is None or sm.stateless:
+        return
+    idle_timeout = _parse_session_idle_timeout()
+    if idle_timeout is not None:
+        sm.session_idle_timeout = idle_timeout
+        logger.info("MCP sesiones stateful: idle_timeout=%ss", idle_timeout)
+
+
+def _mcp_active_sessions() -> int:
+    sm = mcp._session_manager
+    if sm is None or sm.stateless:
+        return 0
+    return len(getattr(sm, "_server_instances", {}))
 
 
 def _get_streamable_app() -> Starlette:
     global _streamable_app
     if _streamable_app is None:
         _streamable_app = mcp.streamable_http_app()
+        _configure_streamable_session_manager()
+        logger.info(
+            "MCP /mcp: stateless=%s json_response=%s sse_habilitado=%s",
+            MCP_STATELESS_HTTP,
+            MCP_JSON_RESPONSE,
+            MCP_ENABLE_SSE,
+        )
     return _streamable_app
 
 
@@ -167,7 +221,7 @@ async def sync_intermapper_data(
     """
     Sincroniza los datos extraídos de Intermapper en las tablas 'torres' y 'dispositivos_ap'.
     """
-    global _active_syncs
+    global _active_syncs, _sync_semaphore
     if _sync_semaphore is None:
         _sync_semaphore = asyncio.Semaphore(MCP_MAX_CONCURRENT_SYNCS)
 
@@ -306,6 +360,8 @@ async def health():
         "status": "ok",
         "uptime_s": round(time.monotonic() - _start_time, 1),
         "active_syncs": _active_syncs,
+        "mcp_active_sessions": _mcp_active_sessions(),
+        "mcp_stateless": MCP_STATELESS_HTTP,
         "mcp_sse": MCP_ENABLE_SSE,
         "mcp_streamable": MCP_ENABLE_STREAMABLE,
     }

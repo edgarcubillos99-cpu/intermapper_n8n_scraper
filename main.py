@@ -218,7 +218,7 @@ async def run_mcp_server(stop_event: asyncio.Event):
         port=Config.MCP_PORT,
         log_level="info",
         timeout_keep_alive=30,
-        limit_concurrency=int(os.getenv("MCP_LIMIT_CONCURRENCY", "80")),
+        limit_concurrency=int(os.getenv("MCP_LIMIT_CONCURRENCY", "200")),
     )
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  
